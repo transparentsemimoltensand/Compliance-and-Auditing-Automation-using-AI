@@ -193,32 +193,26 @@ def convert_table_to_markdown(table_lines, table_config):
     return split_and_format_large_table(table_lines, table_config)
 
 def format_as_markdown(table_lines):
-    """Format table lines as a Markdown table."""
+    """Format table lines as a proper Markdown table with headers."""
     if len(table_lines) < 2:
         return '\n'.join(table_lines)
     
-    # Try to detect column structure
-    columns = detect_columns(table_lines)
-    
-    if columns < 2:
-        # Not a proper table, return original
+    # Check if already formatted as Markdown
+    if table_lines[0].strip().startswith('|') and len(table_lines) > 1 and '---' in table_lines[1]:
         return '\n'.join(table_lines)
     
-    # Format as Markdown table
+    # Convert to Markdown
+    header = table_lines[0]
+    pipe_count = header.count('|')
+    columns = pipe_count + 1 if pipe_count > 0 else len(header.split())
+    
     markdown_lines = []
+    markdown_lines.append(f"| {header} |")
+    markdown_lines.append("| " + " | ".join(["---"] * columns) + " |")
     
-    # Add header row
-    header_line = table_lines[0]
-    markdown_lines.append(f"| {header_line} |")
-    
-    # Add separator row
-    separator = "| " + " | ".join(["---"] * columns) + " |"
-    markdown_lines.append(separator)
-    
-    # Add data rows
-    for line in table_lines[1:]:
-        if line.strip():
-            markdown_lines.append(f"| {line} |")
+    for row in table_lines[1:]:
+        if row.strip():
+            markdown_lines.append(f"| {row} |")
     
     return '\n'.join(markdown_lines)
 
@@ -239,42 +233,99 @@ def detect_columns(table_lines):
         return max(set(column_counts), key=column_counts.count)
     return 0
 
+
 def split_and_format_large_table(table_lines, table_config):
-    """Split large table into multiple Markdown tables with repeated headers."""
+    """Split large table with PROPER header propagation (Gemini's fix)."""
+    if not table_lines or len(table_lines) < 2:
+        return ['\n'.join(table_lines)] if table_lines else []
+    
+    # STEP 1: Convert to proper Markdown if not already
+    formatted_lines = []
+    
+    # Check if already Markdown
+    if table_lines[0].strip().startswith('|'):
+        formatted_lines = table_lines
+    else:
+        # Convert plain text to Markdown
+        header = table_lines[0]
+        pipe_count = header.count('|')
+        columns = pipe_count + 1 if pipe_count > 0 else len(header.split())
+        
+        formatted_lines.append(f"| {header} |")
+        formatted_lines.append("| " + " | ".join(["---"] * columns) + " |")
+        formatted_lines.extend([f"| {row} |" for row in table_lines[1:] if row.strip()])
+    
+    # STEP 2: Group by COMPLETE Station records
+    # Find rows that start new Station records
+    station_rows = []
+    current_group = []
+    
+    for i, line in enumerate(formatted_lines):
+        current_group.append(line)
+        
+        # Check if this is a Station boundary
+        is_station_boundary = (
+            'Station:' in line or 
+            line.strip().startswith('| Station:') or
+            (i < len(formatted_lines) - 1 and 'Station:' in formatted_lines[i + 1])
+        )
+        
+        # Also check if next line starts new logical row
+        if is_station_boundary and len(current_group) > 1:
+            # Don't include the boundary in current group
+            station_rows.append(current_group[:-1])
+            current_group = [line]
+    
+    if current_group:
+        station_rows.append(current_group)
+    
+    # STEP 3: Split with header propagation
     result_tables = []
+    max_rows = table_config.get("max_rows_per_chunk", 12)
     
-    # Extract header (first row)
-    header = table_lines[0]
-    columns = detect_columns([header])
+    current_chunk = []
+    current_row_count = 0
     
-    if columns < 2:
-        # Can't format as table, return original
-        return ['\n'.join(table_lines)]
-    
-    separator = "| " + " | ".join(["---"] * columns) + " |"
-    
-    # Split data rows into chunks
-    data_rows = table_lines[1:]
-    chunk_size = table_config["max_rows_per_chunk"] - 2  # Account for header + separator
-    
-    for i in range(0, len(data_rows), chunk_size):
-        chunk_rows = data_rows[i:i + chunk_size]
+    for group in station_rows:
+        if current_row_count + len(group) > max_rows and current_row_count > 0:
+            # Finalize current chunk
+            result_tables.append('\n'.join(current_chunk))
+            current_chunk = []
+            current_row_count = 0
         
-        # Build Markdown table for this chunk
-        markdown_lines = []
+        # Add group to chunk
+        current_chunk.extend(group)
+        current_row_count += len(group)
+    
+    # Add final chunk
+    if current_chunk:
+        result_tables.append('\n'.join(current_chunk))
+    
+    # STEP 4: Apply Gemini's header propagation rule
+    if len(result_tables) > 1 and table_config.get("header_propagation", True):
+        # Extract headers from first table
+        first_table_lines = result_tables[0].split('\n')
+        headers = []
         
-        # Always include header
-        markdown_lines.append(f"| {header} |")
-        markdown_lines.append(separator)
+        # Find header rows (first lines until separator)
+        for line in first_table_lines:
+            headers.append(line)
+            if '---' in line or line.count('|') >= 2:
+                break
         
-        # Add data rows
-        for row in chunk_rows:
-            if row.strip():
-                markdown_lines.append(f"| {row} |")
+        header_block = '\n'.join(headers)
         
-        result_tables.append('\n'.join(markdown_lines))
+        # Add to continuation chunks
+        final_tables = [result_tables[0]]  # Keep first table as-is
+        
+        for i in range(1, len(result_tables)):
+            continued_table = "**[Table Continued from Previous Section]**\n" + header_block + "\n" + result_tables[i]
+            final_tables.append(continued_table)
+        
+        return final_tables
     
     return result_tables
+
 
 def semantic_chunk_bmr_basic(content, config):
     """Apply semantic chunking to content (tables already formatted)."""
